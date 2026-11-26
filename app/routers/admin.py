@@ -41,7 +41,7 @@ async function load(){
     <span class="n">${d.messages}</span> رسالة · <span class="n">${d.runs}</span> مهمة وكلاء ·
     <span class="n">${d.approvals_pending}</span> موافقة معلقة · <span class="n">${d.artifacts}</span> ملف مولّد</div>`
     + '<h3>أحدث المهام</h3>' + d.recent_runs.map(r=>
-      `<div class="card">#${r.id} — ${r.goal} <b class="${r.status=='done'?'ok':'bad'}">${r.status}</b></div>`).join('');
+      `<div class="card">#${r.id} <b class="${r.status=='done'?'ok':'bad'}">${r.status}</b></div>`).join('');
 }
 </script></body></html>"""
 
@@ -67,7 +67,7 @@ def summary(x_admin_token: str = Header(default=""), db: Session = Depends(get_d
         .scalar(),
         "artifacts": db.query(func.count(Artifact.id)).scalar(),
         "recent_runs": [
-            {"id": r.id, "goal": r.goal[:80], "status": r.status, "created_at": r.created_at}
+            {"id": r.id, "status": r.status, "created_at": r.created_at}
             for r in recent_runs
         ],
     }

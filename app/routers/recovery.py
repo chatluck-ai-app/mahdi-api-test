@@ -11,19 +11,23 @@ conversations to the new device. Single-use, expiring, idempotent.
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..auth import current_device
 from ..db import Conversation, Device, Message, RecoveryAttempt, RecoveryGrant, get_db
+from ..ratelimit import check_ip_limit, client_ip
 
 router = APIRouter(prefix="/v1/recovery", tags=["recovery"])
 
 GRANT_TTL_MINUTES = 15
-MAX_FAILED_CLAIMS = 5
+MAX_FAILED_CLAIMS = 5            # per device
 CLAIM_WINDOW_MINUTES = 10
+CLAIM_IP_LIMIT = 30              # claim attempts per IP per window
+GLOBAL_FAILED_CLAIMS = 50        # all failed claims per window, any device/IP
+MAX_FAILED_CLAIMS_PER_GRANT = 10 # a code locks after this many total failures
 
 
 def _record_attempt(db: Session, device_id: int, code: str, success: bool) -> None:
@@ -46,6 +50,35 @@ def _check_rate_limit(db: Session, device_id: int) -> None:
         raise HTTPException(status_code=429, detail="too many failed attempts; wait 10 minutes")
 
 
+def _check_global_backoff(db: Session) -> None:
+    since = _now() - timedelta(minutes=CLAIM_WINDOW_MINUTES)
+    fails = (
+        db.query(RecoveryAttempt)
+        .filter(
+            RecoveryAttempt.success.is_(False),
+            RecoveryAttempt.created_at >= since.replace(tzinfo=None),
+        )
+        .count()
+    )
+    if fails >= GLOBAL_FAILED_CLAIMS:
+        raise HTTPException(
+            status_code=429, detail="recovery is temporarily busy; try again in a few minutes"
+        )
+
+
+def _lock_if_too_many_failures(db: Session, grant: RecoveryGrant) -> None:
+    if grant.status != "pending":
+        return
+    fails = (
+        db.query(RecoveryAttempt)
+        .filter(RecoveryAttempt.code == grant.code, RecoveryAttempt.success.is_(False))
+        .count()
+    )
+    if fails >= MAX_FAILED_CLAIMS_PER_GRANT:
+        grant.status = "locked"
+        db.commit()
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -58,7 +91,8 @@ def _fresh_code() -> str:
 def _get_grant(db: Session, code: str) -> RecoveryGrant:
     grant = db.query(RecoveryGrant).filter(RecoveryGrant.code == code.strip().upper()).first()
     if grant is None:
-        raise HTTPException(status_code=404, detail="unknown recovery code")
+        # uniform with the wrong-device response: do not reveal code existence
+        raise HTTPException(status_code=404, detail="invalid recovery code")
     if grant.status == "pending" and grant.expires_at.replace(tzinfo=timezone.utc) < _now():
         grant.status = "expired"
         db.commit()
@@ -95,7 +129,15 @@ class ClaimIn(BaseModel):
 
 
 @router.post("/claim")
-def claim_grant(body: ClaimIn, device: Device = Depends(current_device), db: Session = Depends(get_db)):
+def claim_grant(
+    body: ClaimIn,
+    request: Request,
+    device: Device = Depends(current_device),
+    db: Session = Depends(get_db),
+):
+    # layers, cheapest first: per-IP, global backoff, per-device
+    check_ip_limit(db, client_ip(request), "claim", CLAIM_IP_LIMIT, CLAIM_WINDOW_MINUTES)
+    _check_global_backoff(db)
     _check_rate_limit(db, device.id)
     try:
         grant = _get_grant(db, body.code)
@@ -103,8 +145,13 @@ def claim_grant(body: ClaimIn, device: Device = Depends(current_device), db: Ses
         _record_attempt(db, device.id, body.code, False)
         raise
     if grant.new_device_id != device.id:
-        _record_attempt(db, device.id, body.code, False)
-        raise HTTPException(status_code=403, detail="this code belongs to another device")
+        # same status+detail as an unknown code: no existence leak, and the
+        # failure counts toward the grant lock so rotating devices cannot
+        # multiply guesses against this code
+        _record_attempt(db, device.id, grant.code, False)
+        _lock_if_too_many_failures(db, grant)
+        raise HTTPException(status_code=404, detail="invalid recovery code")
+    _lock_if_too_many_failures(db, grant)
     if grant.status == "consumed":
         raise HTTPException(status_code=409, detail="code already used")
     if grant.status != "pending":
@@ -180,5 +227,6 @@ def claim_grant(body: ClaimIn, device: Device = Depends(current_device), db: Ses
 def grant_status(body: ClaimIn, device: Device = Depends(current_device), db: Session = Depends(get_db)):
     grant = _get_grant(db, body.code)
     if grant.new_device_id != device.id:
-        raise HTTPException(status_code=403, detail="this code belongs to another device")
+        # uniform with unknown code: no existence leak
+        raise HTTPException(status_code=404, detail="invalid recovery code")
     return {"code": grant.code, "status": grant.status, "expires_at": grant.expires_at}
