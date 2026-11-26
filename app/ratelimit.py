@@ -1,24 +1,38 @@
-"""Shared client-IP extraction and per-IP request throttling.
+"""Shared client-IP derivation and per-IP request throttling.
 
-Trusted proxy chain for this deployment (verified live on mahdi-api-test):
+Verified live chain on mahdi-api-test (2026-11-26):
 
-    client -> Cloudflare edge -> Render proxy -> uvicorn
+    client -> Cloudflare edge -> Render proxy -> Render internal -> uvicorn
 
-- Cloudflare SETS `CF-Connecting-IP` to the real client IP, overwriting any
-  client-supplied value. This is the primary source.
-- Cloudflare appends the client IP to X-Forwarded-For; Render's proxy then
-  appends the Cloudflare edge IP it received the request from. So the
-  RIGHTMOST XFF entry is a shared Cloudflare/Render edge address (observed
-  live: alternating edge IPs) and must NOT be used. The SECOND-FROM-RIGHT
-  entry is the client IP as Cloudflare reported it: the fallback.
-- With neither header (direct connection, local tests) the peer address is
-  all we have.
+Observed X-Forwarded-For at the app: "client, cloudflare-edge(172.68.x),
+render-internal(10.x)". Facts that make derivation possible WITHOUT any
+injected secret:
 
-Every earlier XFF entry and any client-supplied CF-Connecting-IP on a chain
-without Cloudflare is attacker-controlled and never trusted here.
+- Every hop APPENDS what it saw; a client can only add forged entries on the
+  LEFT. It can never remove or reorder the entries Cloudflare/Render append.
+- So: find the RIGHTMOST Cloudflare-range entry (forged CF-range entries on
+  the left are harmless); the real client is the entry immediately LEFT of it.
+- Every entry to the RIGHT of that CF entry must be Cloudflare or
+  private/internal. A direct-connection forger can craft "client, cf-range"
+  on the left, but the entry the edge appends to its right (the forger's own
+  public IP) breaks that invariant, so forgery fails closed.
+- If CF-Connecting-IP is present it must EQUAL the derived client. Cloudflare
+  overwrites a client-sent CF-Connecting-IP (verified live: forged values
+  never reach the app through CF); a mismatch means a direct-origin forgery
+  attempt.
+- Anything that does not match this structure (direct connections, unknown
+  chains) falls into ONE shared "unknown" bucket: fail-safe (over-throttles,
+  never over-allows), and honest users on the Cloudflare path are unaffected.
+- request.client.host is NEVER used: uvicorn trusts forwarded headers, so the
+  peer is attacker-controlled (verified live).
+
+Cloudflare ranges embedded from https://www.cloudflare.com/ips-v4 and
+https://www.cloudflare.com/ips-v6 on 2026-11-26. If Cloudflare ever adds
+ranges, legit traffic falls into the unknown bucket (fail-safe) until the
+list is refreshed.
 """
 
-import os
+import ipaddress
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, Request
@@ -26,35 +40,63 @@ from sqlalchemy.orm import Session
 
 from .db import IpAttempt
 
-# Cloudflare must inject this header via a Request Header Transform Rule; the
-# app only trusts edge-supplied identity headers when the secret matches.
-# A client connecting directly (bypassing Cloudflare) cannot know the secret.
-TRUSTED_EDGE_HEADER = "x-mahdi-edge"
+CF_NETWORKS = [
+    ipaddress.ip_network(r)
+    for r in [
+        # ips-v4 (2026-11-26)
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+        "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+        "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+        "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+        # ips-v6 (2026-11-26)
+        "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+        "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+    ]
+]
+
+UNKNOWN_BUCKET = "unknown"
 
 
-def _edge_authenticated(request: Request) -> bool:
-    secret = os.getenv("TRUSTED_EDGE_SECRET", "")
-    return bool(secret) and request.headers.get(TRUSTED_EDGE_HEADER, "") == secret
+def _is_cloudflare(addr) -> bool:
+    return any(addr in net for net in CF_NETWORKS)
+
+
+def _is_internal(addr) -> bool:
+    return addr.is_private or addr.is_loopback or addr.is_link_local
+
+
+def derive_client_ip(request: Request) -> tuple[str, str]:
+    """Return (bucket, source): source is "cf-chain" or "unknown"."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    entries = []
+    for part in fwd.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            entries.append((part, ipaddress.ip_address(part)))
+        except ValueError:
+            return UNKNOWN_BUCKET, "unknown"  # malformed chain: trust nothing
+    # rightmost Cloudflare entry that still has entries on both sides
+    for i in range(len(entries) - 2, 0, -1):
+        if not _is_cloudflare(entries[i][1]):
+            continue
+        if all(
+            _is_cloudflare(addr) or _is_internal(addr) for _, addr in entries[i + 1:]
+        ):
+            derived = entries[i - 1][0]
+            cf_header = request.headers.get("cf-connecting-ip", "").strip()
+            if cf_header and cf_header != derived:
+                # CF would have overwritten a forged header; mismatch = direct
+                # origin forgery attempt
+                return UNKNOWN_BUCKET, "unknown"
+            return derived, "cf-chain"
+        return UNKNOWN_BUCKET, "unknown"
+    return UNKNOWN_BUCKET, "unknown"
 
 
 def client_ip(request: Request) -> str:
-    if _edge_authenticated(request):
-        # proven to have passed the trusted edge: Cloudflare overwrote
-        # CF-Connecting-IP with the real client IP there
-        cf = request.headers.get("cf-connecting-ip", "").strip()
-        if cf:
-            return cf[:64]
-        fwd = request.headers.get("x-forwarded-for", "")
-        parts = [p.strip() for p in fwd.split(",") if p.strip()]
-        if len(parts) >= 2:
-            # rightmost is the edge's own address; the entry before it is what
-            # the edge observed as the client
-            return parts[-2][:64]
-    # No trusted-edge proof: NEVER trust client-supplied headers (a direct
-    # connection can forge CF-Connecting-IP and every XFF entry). Bucket by
-    # the direct peer instead. Fail-safe: proxied traffic then shares the
-    # proxy's bucket, which over-throttles rather than over-allows.
-    return (request.client.host if request.client else "unknown")[:64]
+    return derive_client_ip(request)[0]
 
 
 def check_ip_limit(db: Session, ip: str, action: str, limit: int, window_minutes: int) -> None:
