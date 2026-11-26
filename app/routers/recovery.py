@@ -100,7 +100,12 @@ def _get_grant(db: Session, code: str) -> RecoveryGrant:
 
 
 @router.post("/request")
-def request_grant(device: Device = Depends(current_device), db: Session = Depends(get_db)):
+def request_grant(
+    request: Request,
+    device: Device = Depends(current_device),
+    db: Session = Depends(get_db),
+):
+    check_ip_limit(db, client_ip(request), "request", CLAIM_IP_LIMIT, CLAIM_WINDOW_MINUTES)
     # one active grant per new device: older pending ones expire
     db.query(RecoveryGrant).filter(
         RecoveryGrant.new_device_id == device.id, RecoveryGrant.status == "pending"
@@ -135,22 +140,29 @@ def claim_grant(
     device: Device = Depends(current_device),
     db: Session = Depends(get_db),
 ):
-    # layers, cheapest first: per-IP, global backoff, per-device
+    # layers, cheapest first: per-IP, then per-device. Global backoff is NOT
+    # applied here: it is checked below only for guesses (unknown/foreign/dead
+    # codes), so an attacker flooding bad guesses can never block a legitimate
+    # owner who holds a pending grant on their own device.
     check_ip_limit(db, client_ip(request), "claim", CLAIM_IP_LIMIT, CLAIM_WINDOW_MINUTES)
-    _check_global_backoff(db)
     _check_rate_limit(db, device.id)
     try:
         grant = _get_grant(db, body.code)
     except HTTPException:
+        _check_global_backoff(db)
         _record_attempt(db, device.id, body.code, False)
         raise
     if grant.new_device_id != device.id:
         # same status+detail as an unknown code: no existence leak, and the
         # failure counts toward the grant lock so rotating devices cannot
         # multiply guesses against this code
+        _check_global_backoff(db)
         _record_attempt(db, device.id, grant.code, False)
         _lock_if_too_many_failures(db, grant)
         raise HTTPException(status_code=404, detail="invalid recovery code")
+    if grant.status != "pending":
+        # expired/locked/consumed: not an active recovery, pressure applies
+        _check_global_backoff(db)
     _lock_if_too_many_failures(db, grant)
     if grant.status == "consumed":
         raise HTTPException(status_code=409, detail="code already used")
