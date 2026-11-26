@@ -127,6 +127,15 @@ class Artifact(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class IpAttempt(Base):
+    __tablename__ = "mahdi_ip_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ip: Mapped[str] = mapped_column(String(64), index=True)
+    action: Mapped[str] = mapped_column(String(20), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)
 
